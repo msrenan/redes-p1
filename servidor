@@ -3,21 +3,72 @@ import asyncio
 from tcp import Servidor
 import re
 
+NICK_LIST = []
+CLIENTS_CONNECTED = []
 
-def validar_nome(nome):
+class Request:
+    def __init__(self, command, params, spaced_param):
+        self.command = command
+        self.params = params
+        self.spaced_param = spaced_param
+        self.sender = None
+
+    def set_sender(self, sender):
+        self.sender = sender
+
+
+def parse(dados):
+    dados_str = str(dados.decode("utf-8")).replace("\n", "")
+    dados_parts = dados_str.split(":")[0]
+    last_param = ":" + dados_str.split(":")[1]
+
+    command = dados_parts.split(" ")[0]
+    params = dados_parts.split(" ")[1:]
+
+    return Request(command, params, last_param)
+
+
+# ----------------------------------------------------------------------
+
+def validate(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
-
-def sair(conexao):
-    print(conexao, 'conexão fechada')
+def exit(conexao):
+    if conexao.nick == "*":
+        print(f"{conexao.ip}:{conexao.porta} fechou a conexão!")
+    else:
+        print(f"{conexao.nick} fechou a conexão!")
     conexao.fechar()
 
 
-def dados_recebidos(conexao, dados):
+def process_data(conexao, dados):
     if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+        return exit(conexao)
+    
+    req = str(dados.decode("utf-8")).replace("\n", "")
 
+    if (conexao.nick == "*" and req.split(" ")[0] != "NICK"):
+        conexao.enviar(f":server 431 {conexao.nick} {req.split(' ')[0]} :You have not registered\n".encode("utf-8"))
+        
+    else:
+        if req.split(" ")[0] == "NICK":
+            if req.split(" ")[1] not in NICK_LIST:
+                old = conexao.nick
+                conexao.nick = req.split(" ")[1]
+                NICK_LIST.append(conexao.nick)
+                if (conexao.nick != "*"):
+                    conexao.enviar(f":{old} NICK {conexao.nick}\n".encode("utf-8"))
+                else:
+                    conexao.enviar(f":server 001 {conexao.nick} :Welcome".encode("utf-8"))
+                    conexao.enviar(f":server 422 {conexao.nick} :MOTD File is missing")
+            else:
+                conexao.enviar(f":server 433 {conexao.nick} {req.split(' ')[1]} :Nickname is already in use\n".encode("utf-8"))
+        else:
+            if conexao.nick == "*":
+                print(f"{conexao.ip}:{conexao.porta}: \n", req)
+            else:
+                for conn in CLIENTS_CONNECTED:
+                    conn.enviar(f"{conexao.nick}: {req}\n".encode("utf-8"))
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
@@ -26,11 +77,13 @@ def conexao_aceita(conexao):
     # Se precisar, esta função é o melhor local para adicionar novos atributos ao objeto conexao.
     #
     # Por exemplo, para armazenar o nick do usuário:
-    conexao.nick = b'*'
+    conexao.nick = "*"
+    conexao.ip, conexao.porta = conexao.s.getpeername()
 
     # Fique à vontade para adicionar mais atributos, se necessário.
 
-    conexao.registrar_recebedor(dados_recebidos)
+    conexao.registrar_recebedor(process_data)
+    CLIENTS_CONNECTED.append(conexao)
 
 
 servidor = Servidor(6667)
