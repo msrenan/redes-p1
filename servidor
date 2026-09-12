@@ -3,72 +3,291 @@ import asyncio
 from tcp import Servidor
 import re
 
-NICK_LIST = []
-CLIENTS_CONNECTED = []
-
-class Request:
-    def __init__(self, command, params, spaced_param):
-        self.command = command
-        self.params = params
-        self.spaced_param = spaced_param
-        self.sender = None
-
-    def set_sender(self, sender):
-        self.sender = sender
-
-
-def parse(dados):
-    dados_str = str(dados.decode("utf-8")).replace("\n", "")
-    dados_parts = dados_str.split(":")[0]
-    last_param = ":" + dados_str.split(":")[1]
-
-    command = dados_parts.split(" ")[0]
-    params = dados_parts.split(" ")[1:]
-
-    return Request(command, params, last_param)
-
-
-# ----------------------------------------------------------------------
+CLIENTS_CONNECTED = {}
+CHANNELS = {}
+  
 
 def validate(nome):
+    nome = nome.encode("utf-8")
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 def exit(conexao):
-    if conexao.nick == "*":
-        print(f"{conexao.ip}:{conexao.porta} fechou a conexão!")
-    else:
-        print(f"{conexao.nick} fechou a conexão!")
+    for c in CHANNELS.values():
+        if conexao.nick.lower() in c.members.keys():
+            c.quit(conexao)
+
+    if conexao.nick.lower() in CLIENTS_CONNECTED.keys():
+        CLIENTS_CONNECTED.pop(conexao.nick.lower())
+
+
+    print(f"{conexao.nick}({conexao.ip}:{conexao.porta}) fechou a conexão!")
     conexao.fechar()
+
+def log(msg):
+    print(f"\033[94m[SERVER]\033[0m \033[31m>>>\033[0m \033[32m{msg}\033[0m")
+
+# ----------------------------------------------------------------------
+
+class Request:
+    def __init__(self, command, params, spaced_param, conn):
+        self.command = command
+        self.params = params
+        self.spaced_param = spaced_param
+        self.sender = conn
+
+    def __str__(self):
+        return f"[[ command: {self.command} params: {self.params} spaced_params: {self.spaced_param} sender: {self.sender}]]"
+    
+
+class Channel:
+    def __init__(self, name):
+        self.name = name
+        self.members = {}
+    
+    def send_all(self, response, sender=None):
+        log(f"`{response}` foi broadcasted em {self.name}!")
+        for member in self.members.values():
+            if member != sender or sender == None:
+                send(member, response)
+
+    def show_joined(self):
+        msg = " ".join(sorted(self.members.keys()))
+        log(f"Membros atuais de {self.name}:| {msg} |")
+        
+            
+
+    def join(self, conn):
+        log(f"{conn.nick} entrou no canal {self.name}!")
+        self.members[conn.nick.lower()] = conn
+        self.send_all(f":{conn.nick} JOIN :{self.name}")
+        base_str = f":server 353 {conn.nick} = {self.name} :"
+        members_str = ""
+
+        self.show_joined()
+
+        for (_, member) in sorted(self.members.items()):
+            if len(base_str) + 3 + len(members_str) + len(member.nick) > 512:
+                send(conn, f"{base_str}{members_str}")
+                members_str = ""
+            
+            members_str += member.nick + " "
+        if (members_str != ""):
+            send(conn, f"{base_str}{members_str}")
+        send(conn, f":server 366 {conn.nick} {self.name} :End of /NAMES list.")
+    
+    def part(self, conn):
+        log(f"{conn.nick} saiu do canal {self.name}!")
+        self.send_all(f":{conn.nick} PART {self.name}")
+        self.members.pop(conn.nick.lower())
+        self.show_joined()
+    
+    def quit(self, conn):
+        log(f"{conn.nick} saiu do canal {self.name} (QUIT)!")
+        self.members.pop(conn.nick.lower())
+        self.send_all(f":{conn.nick} QUIT", conn)
+        self.show_joined()
+
+    def __str__(self):
+        return f"[[ channel: {self.name} members: {self.members} ]]"
+
+CHANNELS: dict[str, Channel] = {}
+
+frag = False
+frag_data = ""
+
+def parse(dados, conexao) -> list[Request]:
+    global frag, frag_data
+    dados_str_list = str(dados.decode("utf-8")).split("\n")
+
+    if frag:
+        log(f"Carregando dados de fragmentação: {frag_data}, em {dados_str_list[0]}")
+        dados_str_list[0] = frag_data + dados_str_list[0]
+        frag = False
+        frag_data = ""
+
+    if (dados_str_list[-1] != ""):
+        log(f"{dados} tem fragmentação!")
+        frag = True
+        frag_data += dados_str_list[-1]
+        dados_str_list.pop(-1)
+
+    req_list = []
+
+    for dados_str in dados_str_list:
+        if dados_str == "":
+            continue
+
+        if " :" in dados_str:
+            dados_parts = dados_str.split(" :")[0].strip()
+            last_param = dados_str.split(" :")[1].strip()
+        else:
+            dados_parts = dados_str.strip()
+            last_param = None
+        
+
+        command = dados_parts.split(" ")[0]
+        params = dados_parts.split(" ")[1:]
+
+        req = Request(command, params, last_param, conexao)
+
+        #log(f"Request recebida: {req}")
+
+        req_list.append(req)
+
+    return req_list
+
+
+def send(conn, response):
+    try:
+        conn.enviar(f"{response}\r\n".encode("utf-8"))
+        #log(f"`{response.encode('utf-8')}` foi enviado para {conn.nick}({conn.ip}:{conn.porta})!")
+    except (BrokenPipeError, ConnectionResetError):
+        exit(conn)
 
 
 def process_data(conexao, dados):
+    #dados = str(dados.decode("utf-8"))
     if dados == b'':
         return exit(conexao)
-    
-    req = str(dados.decode("utf-8")).replace("\n", "")
 
-    if (conexao.nick == "*" and req.split(" ")[0] != "NICK"):
-        conexao.enviar(f":server 431 {conexao.nick} {req.split(' ')[0]} :You have not registered\n".encode("utf-8"))
-        
-    else:
-        if req.split(" ")[0] == "NICK":
-            if req.split(" ")[1] not in NICK_LIST:
+
+    reqs = parse(dados, conexao)
+
+    for req in reqs:
+        if req.command == "PING":
+            if len(req.params) < 1:
+                log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um {req.command}\
+                    com parâmetros inválidos/ausentes!")
+                send(req.sender, f":server 431 {req.sender.nick} {req.command} :Not enough parameters")
+                continue
+
+            log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) pingou o servidor!")
+            send(req.sender, f":server PONG server :{req.params[0]}")
+        elif req.command == "NICK":
+            if len(req.params) != 1:
+                log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um comando {req.command}\
+                    com parâmetros inválidos/ausentes!")
+                send(req.sender, f":server 431 {req.sender} {req.command} :No nickname given")
+                continue
+
+            if not validate(req.params[0]):
+                log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um nick invalido.")
+                send(req.sender, f":server 432 {req.sender.nick} {req.params[0]} :Erroneous nickname")
+                continue
+
+            if req.sender.nick == "*":
+                #Registro
+                if req.params[0].lower() in CLIENTS_CONNECTED.keys():
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou se registrar como {req.params[0]},\
+                        que já está em uso!")
+                    send(req.sender, f":server 433 {req.sender.nick} {req.params[0]} :Nickname is already in use")
+                    continue
+                
+                conexao.nick = req.params[0]
+                log(f"{req.params[0]} se registrou com sucesso!")
+                send(req.sender, f":server 001 {req.sender.nick} :Welcome")
+                send(req.sender, f":server 422 {req.sender.nick} :MOTD File is missing")
+                CLIENTS_CONNECTED[conexao.nick.lower()] = conexao
+            else:
+                #Alteração
+                if req.params[0].lower() in CLIENTS_CONNECTED.keys():
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou alterar seu nick para {req.params[0]},\
+                        que já está em uso!")
+                    send(req.sender, f":server 433 {req.sender.nick} {req.params[0]} :Nickname is already in use")
+                    continue
+                
                 old = conexao.nick
-                conexao.nick = req.split(" ")[1]
-                NICK_LIST.append(conexao.nick)
-                if (conexao.nick != "*"):
-                    conexao.enviar(f":{old} NICK {conexao.nick}\n".encode("utf-8"))
-                else:
-                    conexao.enviar(f":server 001 {conexao.nick} :Welcome".encode("utf-8"))
-                    conexao.enviar(f":server 422 {conexao.nick} :MOTD File is missing")
-            else:
-                conexao.enviar(f":server 433 {conexao.nick} {req.split(' ')[1]} :Nickname is already in use\n".encode("utf-8"))
+                conexao.nick = req.params[0]
+                log(f"{old} alterou seu nick para {req.params[0]}")
+                send(req.sender, f":{old} NICK {req.params[0]}")
+                CLIENTS_CONNECTED[conexao.nick.lower()] = conexao
+                CLIENTS_CONNECTED.pop(old.lower())
         else:
-            if conexao.nick == "*":
-                print(f"{conexao.ip}:{conexao.porta}: \n", req)
+            if req.sender.nick == "*":
+                log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou {req.command} sem estar registrado!")
+                send(req.sender, f":server 431 {req.sender.nick} {req.command} :You have not registered")
+                continue
+
+            if req.command == "JOIN":
+                if len(req.params) != 1:
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um {req.command}\
+                        com parâmetros inválidos/ausentes!")
+                    send(req.sender, f":server 461 {req.sender.nick} {req.command} :Invalid parameters")
+                    continue
+
+                if not req.params[0][0] == '#' or not validate(req.params[0][1:]):
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou entrar em um canal inválido.")
+                    send(req.sender, f":server 403 {req.sender.nick} {req.params[0]} :No such channel")
+                    continue
+                
+                if req.params[0].lower() in CHANNELS.keys():
+                    #Canal existe
+                    channel = CHANNELS[req.params[0].lower()]
+                    channel.join(conexao)
+
+                else:
+                    #Canal não existe
+                    log(f"{req.sender.nick} criou o canal {req.params[0]}")
+                    channel = Channel(req.params[0])
+                    channel.join(req.sender)
+                    CHANNELS[channel.name.lower()] = channel
+                continue
+            
+            elif req.command == "PART":
+                if len(req.params) != 1:
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um {req.command}\
+                        com parâmetros inválidos/ausentes!")
+                    send(req.sender, f":server 461 {req.sender.nick} {req.command} :Invalid parameters")
+                    continue
+
+                if not req.params[0][0] == '#' or not validate(req.params[0][1:]) or not req.params[0].lower() in CHANNELS.keys():
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou sair de um canal inválido.")
+                    send(req.sender, f":server 403 {req.sender.nick} {req.params[0]} :No such channel")
+                    continue
+                
+                channel = CHANNELS[req.params[0].lower()]
+                channel.part(req.sender)
+                continue
+            
+            elif req.command == "PRIVMSG":
+                if len(req.params) != 1 or req.spaced_param == None:
+                    log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) enviou um {req.command}\
+                        com parâmetros inválidos/ausentes!")
+                    send(req.sender, f":server 461 {req.sender.nick} {req.command} :Invalid parameters")
+                    continue
+
+                dest = req.params[0]
+                msg = req.spaced_param
+
+                if dest[0] == '#':
+                    if not validate(dest[1:]) or not dest.lower() in CHANNELS.keys():
+                        log(f"{req.sender.nick}({req.sender.ip}:{req.sender.porta}) tentou enviar uma mensagem para um canal inválido.")
+                        send(req.sender, f":server 403 {req.sender.nick} {dest} :No such channel")
+                        continue
+
+                    #Canal
+                    channel = CHANNELS[dest.lower()]
+                    if req.sender.nick.lower() in channel.members.keys():
+                        log(f"{req.sender.nick} enviou `{req.spaced_param.encode('utf-8')}` para {channel.name}!")
+                        channel.send_all(f":{req.sender.nick} PRIVMSG {dest} :{msg}", sender=req.sender)
+                    else:
+                        log(f"{req.sender.nick} tentou enviar uma mensagem para um canal que ele não entrou.")
+                        send(req.sender, f":server 442 {req.sender.nick} {req.command} :You have not joined this channel")
+                else:
+                    #Para outro client
+                    if not validate(dest) or not req.params[0].lower() in CLIENTS_CONNECTED.keys():
+                        log(f"{req.sender.nick} tentou enviar uma mensagem para um usuário ausente!")
+                        #send(req.sender, f":server 411 {req.sender.nick} {dest} :No such nick")
+                        continue
+
+                    user = CLIENTS_CONNECTED[dest.lower()]
+                    log(f"{req.sender.nick} enviou `{req.spaced_param.encode('utf-8')}` para {user.nick}!")
+                    send(user, f":{req.sender.nick} PRIVMSG {user.nick} :{msg}")
+                continue
             else:
-                for conn in CLIENTS_CONNECTED:
-                    conn.enviar(f"{conexao.nick}: {req}\n".encode("utf-8"))
+                log(f"Comando {req.command} enviado por {req.sender.nick} não é tratado!")
+                send(req.sender, f":server 421 {req.sender.nick} {req.command} :Unknown command")
+
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
@@ -83,7 +302,6 @@ def conexao_aceita(conexao):
     # Fique à vontade para adicionar mais atributos, se necessário.
 
     conexao.registrar_recebedor(process_data)
-    CLIENTS_CONNECTED.append(conexao)
 
 
 servidor = Servidor(6667)
